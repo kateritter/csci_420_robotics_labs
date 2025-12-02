@@ -7,7 +7,7 @@
 
 <!--   <include file="$(find-pkg-share flightcontroller)/launch/velocity.launch"> -->
 <!--   </include> -->
-
+<node pkg="tf2_ros" exec="static_transform_publisher" name="tower_broadcaster" args="72.721443 -131.193 0.0 -0.5235987756 0.0 0.0 world tower"/>
   <include file="$(find-pkg-share flightcontroller)/launch/position.launch">
   </include>
 
@@ -35,6 +35,6 @@
 
   <node name="tower" pkg="flightcontroller" exec="tower.py" output="screen"/>
   <node pkg="flightcontroller" exec="ground_robot_physics.py" name="ground_robot_physics" output="screen"></node>
-
+  <node pkg="simple_control" exec="tower_to_map" name="tower_to_map_node" output="screen"/>
 
 </launch>
