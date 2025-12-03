@@ -6,4 +6,13 @@
 
   <!-- TODO -->
 
+  <!-- Run the student rescue mission node (initial demo implementation). -->
+  <!-- This node publishes /map and attempts the demo door-opening behavior. -->
+  <node pkg="simple_control" exec="rescue_mission" name="rescue_mission" output="screen">
+    <!-- forwards map size as params for convenience (node will fall back to defaults)
+         depending on launch-time support for parameters in the environment -->
+    <param name="map_width" value="$(var map_width)"/>
+    <param name="map_height" value="$(var map_height)"/>
+  </node>
+
 </launch>
