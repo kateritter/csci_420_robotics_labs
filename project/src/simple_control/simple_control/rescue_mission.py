@@ -14,6 +14,7 @@ required for the final checkpoint:
 from __future__ import annotations
 
 import math
+import time
 import heapq
 import rclpy
 from rclpy.node import Node
@@ -25,6 +26,8 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int32, Int32MultiArray
 
 from environment_controller.srv import UseKey
+
+from .door_detector import DoorDetector
 
 import tf2_ros
 from tf2_ros import TransformException
@@ -118,6 +121,12 @@ class RescueMission(Node):
         # mark start cell free
         sx, sy = self.world_to_map(0.0, 0.0)
         self.set_cell(sx, sy, 0)
+
+        # door detector: sample spaced LiDAR readings and flag beam outliers
+        self.door_detector = DoorDetector(buffer_size=6, sample_interval=0.8, std_multiplier=2.0)
+        
+        # track detected doors to prevent false positives from drone position jitter
+        self.detected_doors = set()  # set of (mx, my) tuples that are confirmed doors
 
         self.get_logger().info(f"Rescue mission initialized. Map {self.map_width}x{self.map_height}")
 
@@ -238,6 +247,48 @@ class RescueMission(Node):
                     self.set_cell(mx, my, cur + 30)
 
             angle += msg.angle_increment
+
+        # Door detection: sample scans at a lower rate to avoid GPS/LIDAR jitter
+        try:
+            sampled = self.door_detector.sample_scan(msg)
+            if sampled:
+                candidates = self.door_detector.detect_standouts()
+                for beam_idx, stdv in candidates:
+                    ang = msg.angle_min + beam_idx * msg.angle_increment
+                    r = self.door_detector.latest_range_for(beam_idx)
+                    if not math.isfinite(r):
+                        r = msg.range_max if math.isfinite(msg.range_max) else 5.0
+
+                    hx = self.drone_x + r * math.cos(ang)
+                    hy = self.drone_y + r * math.sin(ang)
+                    mx, my = self.world_to_map(hx, hy)
+
+                    # Filter 1: Don't mark detections at or very close to drone's current position
+                    drone_mx, drone_my = self.world_to_map(self.drone_x, self.drone_y)
+                    dist_to_drone = math.hypot(mx - drone_mx, my - drone_my)
+                    if dist_to_drone < 0.5:
+                        continue
+
+                    cur = self.get_cell(mx, my)
+                    if cur is not None and cur not in (-1, -2, -3):
+                        # Filter 2: Check if this detection clusters with any already-detected door
+                        is_new_door = True
+                        for ddx, ddy in self.detected_doors:
+                            if math.hypot(mx - ddx, my - ddy) < 1.5:
+                                is_new_door = False
+                                break
+                        
+                        if is_new_door:
+                            # mark as suspected closed door with special value -1 for visual distinction
+                            idx = self.map_index(mx, my)
+                            if idx >= 0:
+                                self.grid[idx] = -1
+                            self.detected_doors.add((mx, my))
+                            # only log if enough time has passed (avoid spam)
+                            if self.door_detector.should_report_candidate(mx, my, report_cooldown=5.0):
+                                self.get_logger().info(f"New door detected at ({mx}, {my}) from beam {beam_idx} (std={stdv:.3f})")
+        except Exception as e:
+            self.get_logger().warn(f"Door detection error: {e}")
 
     # ============================
     # Mission step machine
