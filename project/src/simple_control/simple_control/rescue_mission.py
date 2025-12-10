@@ -139,6 +139,11 @@ class RescueMission(Node):
         # Mission state machine
         self.state = self.EXPLORING_WORLD
 
+        # Movement pause system (for tile-by-tile motion)
+        self.movement_pause = False      # True while waiting after arriving on a tile
+        self.pause_duration = 1.0        # seconds to pause between tiles
+        self.pause_timer = None          # rclpy.Timer object that clears the pause
+
         # Timers
         self.create_timer(0.5, self.publish_map)
         self.create_timer(0.2, self.mission_step)
@@ -213,9 +218,9 @@ class RescueMission(Node):
         wrapped.point = msg
         self.dog_msg = wrapped
 
-        self.get_logger().info(
+        """ self.get_logger().info(
             f"[DOG] Point wrapped → PointStamped: ({msg.x:.2f}, {msg.y:.2f}, {msg.z:.2f})"
-        )
+        ) """
 
     def lidar_callback(self, msg: LaserScan):
         # Mapping happens regardless of mission state
@@ -493,8 +498,27 @@ class RescueMission(Node):
                 return False
 
         return True
+    
+    # Helper Method
+    def resume_movement(self):
+        """Timer callback: resume movement after a pause."""
+        self.get_logger().info("[MOVE] Pause finished → resuming movement.")
+        self.movement_pause = False
+
+        # Clean up the timer so we don't leak them
+        if self.pause_timer is not None:
+            self.pause_timer.cancel()
+            self.pause_timer = None
 
     def follow_path_step(self):
+        # If we are currently paused, do nothing this tick
+        if self.movement_pause:
+            self.get_logger().info(
+                f"[MOVE] Paused between tiles; wp_index={self.wp_index}/{len(self.current_path_world)} "
+                f"| drone=({self.drone_x:.2f},{self.drone_y:.2f})"
+            )
+            return
+
         # High-level movement debug
         self.get_logger().info(
             f"[MOVE] State=MOVING_TO_WAYPOINT | wp_index={self.wp_index}/{len(self.current_path_world)} "
@@ -539,9 +563,7 @@ class RescueMission(Node):
             self.state = self.LOCATING_DOORS
             return
 
-        # ----------------------------------------------------------
         #  MOVEMENT LOGIC: MOVE IN STRAIGHT LINES (NO DIAGONALS)
-        # ----------------------------------------------------------
 
         dx = wx - self.drone_x
         dy = wy - self.drone_y
@@ -559,15 +581,13 @@ class RescueMission(Node):
             target_y = self.drone_y + step
 
         self.get_logger().info(
-            f"[MOVE] Moving straight-line step → ({target_x:.2f}, {target_y:.2f})"
+            f"[MOVE] Stepping toward tile center → ({target_x:.2f}, {target_y:.2f})"
         )
 
         cmd = Vector3(x=float(target_x), y=float(target_y), z=0.0)
         self.cmd_pub.publish(cmd)
 
-        # ----------------------------------------------------------
-        # ARRIVAL CHECK
-        # ----------------------------------------------------------
+        # ARRIVAL + PAUSE BETWEEN TILES
 
         dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
         self.get_logger().info(f"[MOVE] Distance to WP = {dist:.3f}")
@@ -582,12 +602,20 @@ class RescueMission(Node):
                 if idx >= 0:
                     self.grid[idx] = 100
                     self.get_logger().info(
-                        f"[DOOR] Sealed door at {mx,my} AFTER visiting (correct behavior)"
+                        f"[DOOR] Sealed door at {mx,my} AFTER visiting."
                     )
 
             # Advance to next waypoint
             self.wp_index += 1
-            self.get_logger().info(f"[MOVE] Advancing to WP#{self.wp_index}")
+            self.get_logger().info(
+                f"[MOVE] Advancing to WP#{self.wp_index} and pausing for {self.pause_duration:.1f}s."
+            )
+
+            # Engage pause so we don't immediately start stepping toward the next tile
+            self.movement_pause = True
+            if self.pause_timer is not None:
+                self.pause_timer.cancel()
+            self.pause_timer = self.create_timer(self.pause_duration, self.resume_movement)
 
     # ============================
     # LOCATING_DOORS
@@ -636,6 +664,8 @@ class RescueMission(Node):
             )
             self.state = self.UPDATING_MAP
             return
+        
+        self.get_logger().info(f"[DEBUG] Trying door at {self.current_door_cell}, real WP is {self.current_path_cells[:3]}")
 
         if self.keys_remaining <= 0:
             self.get_logger().info(
