@@ -38,7 +38,7 @@ from rosidl_runtime_py.utilities import get_message
 
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-from simple_control.astar_class import AStarPlanner 
+from simple_control.astar_class import AStarPlanner
 
 
 class RescueMission(Node):
@@ -46,7 +46,7 @@ class RescueMission(Node):
 
     # ============================
     # Mission states (your design)
-    # ============================ 
+    # ============================
     EXPLORING_WORLD = 0
     LOCATING_DOORS = 1
     OPENING_DOORS = 2
@@ -64,8 +64,8 @@ class RescueMission(Node):
         self.declare_parameter('map_width', default_w)
         self.declare_parameter('map_height', default_h)
 
-        self.map_width = int(self.get_parameter('map_width').get_parameter_value().integer_value)
-        self.map_height = int(self.get_parameter('map_height').get_parameter_value().integer_value)
+        self.map_width = int(self.get_parameter('map_width').value)
+        self.map_height = int(self.get_parameter('map_height').value)
 
         # We use 1 meter per cell (resolution 1.0)
         self.resolution = 1.0
@@ -94,9 +94,10 @@ class RescueMission(Node):
         self.key_sub = self.create_subscription(
             Int32, "/keys_remaining", self.keys_cb, 10
         )
-        self.map_sub = self.create_subscription(
-            OccupancyGrid, "/map", self.map_callback, 10
-        )
+        # Don't subscribe to external map - we build our own from LIDAR
+        # self.map_sub = self.create_subscription(
+        #     OccupancyGrid, "/map", self.map_callback, 10
+        # )
         self.dog_sub = self.create_subscription(
             Point, '/cell_tower/position', self.dog_callback, 10
         )
@@ -156,11 +157,10 @@ class RescueMission(Node):
     # Coordinate conversions
     # ============================
 
-    def world_to_map(self, wx: float, wy: float) -> tuple[int, int]:
+    def world_to_map(self, wx: float, wy: float) -> tuple:
         mx = int(math.floor((wx - self.origin_x) + 0.5))
         my = int(math.floor((wy - self.origin_y) + 0.5))
         return mx, my
-
 
     def map_to_world(self, mx, my):
         wx = self.origin_x + (mx + 0.5) * self.resolution
@@ -203,23 +203,8 @@ class RescueMission(Node):
     def keys_cb(self, msg: Int32):
         self.keys_remaining = msg.data
 
-    def map_callback(self, msg):
-        self.map = msg
-        self.map_ready = True
-
-        self.map_width = msg.info.width
-        self.map_height = msg.info.height
-        self.resolution = msg.info.resolution
-
-        self.origin_x = msg.info.origin.position.x
-        self.origin_y = msg.info.origin.position.y
-
-        # Convert map data from int8 array to Python list
-        self.grid = list(msg.data)
-
-        self.get_logger().info(
-            f"Map loaded: {self.map_width}x{self.map_height}, origin=({self.origin_x},{self.origin_y}), res={self.resolution}"
-        )
+    # Note: map_callback removed - we build our own map from LIDAR data
+    # The external /map topic may have different dimensions/origin causing conflicts
 
     def dog_callback(self, msg):
         wrapped = PointStamped()
@@ -296,7 +281,7 @@ class RescueMission(Node):
                         continue
 
                     cur = self.get_cell(mx, my)
-                    if cur is not None and cur not in (-1, -2, -3):
+                    if cur is not None and cur not in (-1, -2, -3) and cur >= 70 and stdv > 0.05:
                         # avoid duplicating the same door in slightly different cells
                         is_new_door = True
                         for ddx, ddy in self.detected_doors:
@@ -321,7 +306,7 @@ class RescueMission(Node):
             self.get_logger().warn(f"Door detection error: {e}")
 
     # ============================
-    # Updating Goal 
+    # Updating Goal
     # ============================
 
     def update_goal_from_tf(self):
@@ -329,40 +314,30 @@ class RescueMission(Node):
             return
 
         try:
-            """ # 1. Construct origin  in cell_tower frame
-            p = PointStamped()
-            p.header.frame_id = "cell_tower"
-            p.header.stamp = rclpy.time.Time().to_msg()
-            p.point.x = 0
-            p.point.y = 0
-            p.point.z = 0 """
-
-            # 2. Transform it into world frame
+            # Transform dog position from cell_tower to world frame
             transform = self.tf_buffer.lookup_transform("cell_tower", "world", rclpy.time.Time())
             dwp = do_transform_point(self.dog_msg, transform)
-            # origin_world_point = do_transform_point(p, transform)
 
             self.get_logger().info(
                 f"[TF] dog_world    = ({dwp.point.x:.2f}, "
                 f"{dwp.point.y:.2f}, {dwp.point.z:.2f})"
             )
 
-            # 2. Take transformed dog x and y
-            gdx = dwp.point.x 
+            # Take transformed dog x and y
+            gdx = dwp.point.x
             gdy = dwp.point.y
 
             self.get_logger().info(
                 f"[TF-GOAL] Dog world position = ({gdx:.2f}, {gdy:.2f})"
             )
 
-            # 3. Convert world → map
+            # Convert world → map
             mx, my = self.world_to_map(gdx, gdy)
             self.goal_cell = (mx, my)
             self.has_goal = True
 
         except Exception as e:
             self.get_logger().debug(f"[TF-GOAL] failed: {e}")
-
 
     # ============================
     # Mission State Machine
@@ -496,7 +471,7 @@ class RescueMission(Node):
         Returns True if path is clear.
         """
         dist = math.hypot(tx - sx, ty - sy)
-        
+
         # If the point is basically the same, treat as clear
         if dist < 1e-3:
             return True
@@ -599,9 +574,6 @@ class RescueMission(Node):
 
         if dist < 0.4:
             self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index}")
-            
-            # Add current cell to visited set
-            self.visited_cells.add((mx, my))
 
             # If this was an open door AND we have now passed through it,
             # then convert it to a wall (100) only AFTER leaving it.
@@ -616,7 +588,6 @@ class RescueMission(Node):
             # Advance to next waypoint
             self.wp_index += 1
             self.get_logger().info(f"[MOVE] Advancing to WP#{self.wp_index}")
-
 
     # ============================
     # LOCATING_DOORS
