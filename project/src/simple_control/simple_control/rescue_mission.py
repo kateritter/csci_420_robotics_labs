@@ -578,8 +578,28 @@ class RescueMission(Node):
             f"[MOVE] Arrived at waypoint ({target_mx},{target_my}) — pausing"
         )
 
-        # Pause 1 sec and then advance wp_index
-        def advance_wp():
+        cmd = Vector3(x=float(target_x), y=float(target_y), z=0.0)
+        self.cmd_pub.publish(cmd)
+
+        # ARRIVAL + PAUSE BETWEEN TILES
+
+        dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
+        self.get_logger().info(f"[MOVE] Distance to WP = {dist:.3f}")
+
+        if dist < 0.4:
+            self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index}")
+
+            # If this was an open door AND we have now passed through it,
+            # then convert it to a wall (100) only AFTER leaving it.
+            if cell == -2:
+                idx = self.map_index(mx, my)
+                if idx >= 0:
+                    self.grid[idx] = 100
+                    self.get_logger().info(
+                        f"[DOOR] Sealed door at {mx,my} AFTER visiting."
+                    )
+
+            # Advance to next waypoint
             self.wp_index += 1
             self.movement_pause = False
             self.pause_timer = None
@@ -587,7 +607,6 @@ class RescueMission(Node):
         if not self.movement_pause:
             self.movement_pause = True
             self.pause_timer = self.create_timer(self.pause_duration, advance_wp)
-
 
     # ============================
     # LOCATING_DOORS
