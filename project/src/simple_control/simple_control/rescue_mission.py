@@ -383,21 +383,22 @@ class RescueMission(Node):
             return
 
     # ============================
-    # A* Planning
+    # A* Planning (restored original logic)
     # ============================
 
     def is_free(self, mx, my):
         val = self.get_cell(mx, my)
         if val is None:
             return False
-        if val == -1:   # closed door cell (treated as obstacle until opened)
+        if val == -1:   # closed door
             return False
-        if val in (-2, -3):  # open door or goal
+        if val in (-2, -3):  # open door, goal
             return True
         return val < 70
 
     def neighbors(self, mx, my):
-        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+        """Manhattan neighbors only."""
+        for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:
             nx, ny = mx + dx, my + dy
             if 0 <= nx < self.map_width and 0 <= ny < self.map_height:
                 if self.is_free(nx, ny):
@@ -414,6 +415,7 @@ class RescueMission(Node):
         while pq:
             _, cur = heapq.heappop(pq)
 
+            # reached goal
             if cur == goal:
                 path = []
                 c = cur
@@ -423,9 +425,9 @@ class RescueMission(Node):
                 return path[::-1]
 
             for nbr in self.neighbors(*cur):
-                cell_val = self.get_cell(*nbr)
-                step = 1.0 + (0.2 if cell_val == 50 else 0.0)
-                new_g = g[cur] + step
+                val = self.get_cell(*nbr)
+                step_cost = 1.0 + (0.2 if val == 50 else 0.0)
+                new_g = g[cur] + step_cost
 
                 if new_g < g.get(nbr, 1e9):
                     g[nbr] = new_g
@@ -442,20 +444,24 @@ class RescueMission(Node):
         path = self.astar(start, goal)
 
         if not path:
-            self.get_logger().warn("A* failed → no path currently, will retry later.")
-            self.current_path_cells = []
-            self.current_path_world = []
-            self.wp_index = 0
+            self.get_logger().warn("A* failed → no path found.")
+
+            # NEW BEHAVIOR: allow door logic to take over
+            if self.detected_doors:
+                # treat start as the blocked cell to trigger door-opening logic
+                self.current_blocked_cell = start
+                self.state = self.LOCATING_DOORS
+                self.get_logger().info(
+                    f"[DOORS] A* failed — using blocked cell {start} to locate doors."
+                )
             return
 
+        # Path valid
         self.current_path_cells = path
         self.current_path_world = [self.map_to_world(mx, my) for (mx, my) in path]
         self.wp_index = 0
-        self.get_logger().info(
-            f"[PLAN] Path length={len(path)} | First WP={path[0] if path else None}"
-        )
 
-        # debug path publish
+        # Debug output
         flat = []
         for mx, my in path:
             flat.extend([mx, my])
@@ -463,17 +469,24 @@ class RescueMission(Node):
         self.debug_path_pub.publish(msg)
 
         self.get_logger().info(
-            f"New path planned with {len(self.current_path_world)} waypoints."
+            f"[PLAN] Path length={len(path)} | first={path[0]}"
         )
 
     # ============================
-    # MOVING_TO_WAYPOINT
+    # MOVING_TO_WAYPOINT (Manhattan dominant axis + pause at every tile)
     # ============================
+
+    def resume_movement(self):
+        self.get_logger().info("[MOVE] Pause finished → resuming movement.")
+        self.movement_pause = False
+        if self.pause_timer is not None:
+            self.pause_timer.cancel()
+            self.pause_timer = None
+
     def path_clear_between(self, sx, sy, tx, ty, step=0.2):
         """
-        Check if the line from (sx, sy) to (tx, ty) crosses any blocked cell.
-        step: distance increments in meters.
-        Returns True if path is clear.
+        Check if the straight line between two world coordinates passes through
+        any blocked cell. Manhattan planner still benefits from this check.
         """
         dist = math.hypot(tx - sx, ty - sy)
 
@@ -491,85 +504,42 @@ class RescueMission(Node):
             cell = self.get_cell(mx, my)
 
             # Blocked if:
-            #   - outside map (cell is None)
-            #   - high occupancy (>= 70)
-            #   - closed door (-1)
-            if cell is None or cell >= 70 or cell == -1:
+            if cell is None or cell >= 70 or cell == -1:  # obstacle or closed door
                 return False
 
         return True
-    
-    # Helper Method
-    def resume_movement(self):
-        """Timer callback: resume movement after a pause."""
-        self.get_logger().info("[MOVE] Pause finished → resuming movement.")
-        self.movement_pause = False
 
-        # Clean up the timer so we don't leak them
-        if self.pause_timer is not None:
-            self.pause_timer.cancel()
-            self.pause_timer = None
 
     def follow_path_step(self):
-        """
-        Executes waypoint following for MOVING_TO_WAYPOINT state.
-
-        Ensures:
-        • uses the latest A* path (self.current_path_cells)
-        • waypoint index is valid
-        • pauses between tiles
-        • door-adjacent paths behave correctly
-        """
-
-        # Ensure GPS lock
-        if not self.has_gps:
+        # Pause active?
+        if self.movement_pause:
             return
 
-        # Empty path? → replan
-        if not self.current_path_cells:
-            self.get_logger().warn("[MOVE] No path → UPDATING_MAP")
-            self.state = self.UPDATING_MAP
+        # No GPS or no path?
+        if not self.current_path_world:
             return
 
-        # Valid waypoint index?
-        if self.wp_index >= len(self.current_path_cells):
-            self.get_logger().info("[MOVE] Reached end of path → UPDATING_MAP")
-            self.state = self.UPDATING_MAP
+        if self.wp_index >= len(self.current_path_world):
+            self.get_logger().info("[MOVE] Path complete → AT_GOAL")
+            self.publish_final_path()
+            self.state = self.AT_GOAL
             return
 
-        # Current target waypoint
-        target_mx, target_my = self.current_path_cells[self.wp_index]
-        tx, ty = self.map_to_world(target_mx, target_my)
+        # Extract waypoint
+        wx, wy = self.current_path_world[self.wp_index]
+        mx, my = self.world_to_map(wx, wy)
+        cell = self.get_cell(mx, my)
 
-        # DEBUG — ensure the path is correct
-        self.get_logger().info(
-            f"[MOVE] wp_index={self.wp_index}/{len(self.current_path_cells)} "
-            f"target_map=({target_mx},{target_my}) target_world=({tx:.2f},{ty:.2f})"
-        )
-
-        # Check for blocked tile
-        cell_val = self.get_cell(target_mx, target_my)
-        if cell_val is None:
-            self.get_logger().warn("[MOVE] Target out of bounds → UPDATING_MAP")
-            self.state = self.UPDATING_MAP
-            return
-
-        if cell_val >= 70 or cell_val == -1:
-            self.get_logger().warn(
-                f"[BLOCK] Path blocked at ({target_mx},{target_my}) (val={cell_val}) "
-                f"→ LOCATING_DOORS"
-            )
-            self.current_blocked_cell = (target_mx, target_my)
+        # Blocked waypoint → go to doors
+        if cell is None or cell == -1 or cell >= 70:
+            self.current_blocked_cell = (mx, my)
             self.state = self.LOCATING_DOORS
             return
 
-        # Move toward the waypoint
-        dist = math.hypot(self.drone_x - tx, self.drone_y - ty)
-
-        if dist > 0.3:
-            # Move closer
-            cmd = Vector3(x=float(tx), y=float(ty), z=0.0)
-            self.cmd_pub.publish(cmd)
+        # Check the ray between current position and waypoint
+        if not self.path_clear_between(self.drone_x, self.drone_y, wx, wy):
+            self.current_blocked_cell = (mx, my)
+            self.state = self.LOCATING_DOORS
             return
 
         # Arrived at waypoint
@@ -601,12 +571,11 @@ class RescueMission(Node):
 
             # Advance to next waypoint
             self.wp_index += 1
-            self.movement_pause = False
-            self.pause_timer = None
-
-        if not self.movement_pause:
             self.movement_pause = True
-            self.pause_timer = self.create_timer(self.pause_duration, advance_wp)
+
+            if self.pause_timer:
+                self.pause_timer.cancel()
+            self.pause_timer = self.create_timer(self.pause_duration, self.resume_movement)
 
     # ============================
     # LOCATING_DOORS
