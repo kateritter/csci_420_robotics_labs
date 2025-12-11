@@ -433,7 +433,6 @@ class RescueMission(Node):
                     g[nbr] = new_g
                     came[nbr] = cur
                     heapq.heappush(pq, (new_g + h(nbr, goal), nbr))
-
         return []
 
     def plan_path(self):
@@ -509,7 +508,6 @@ class RescueMission(Node):
 
         return True
 
-
     def follow_path_step(self):
         # Pause active?
         if self.movement_pause:
@@ -545,10 +543,10 @@ class RescueMission(Node):
         # Arrived at waypoint
         # Tile-based pause
         self.get_logger().info(
-            f"[MOVE] Arrived at waypoint ({target_mx},{target_my}) — pausing"
+            f"[MOVE] Arrived at waypoint ({mx},{my}) — pausing"
         )
 
-        cmd = Vector3(x=float(target_x), y=float(target_y), z=0.0)
+        cmd = Vector3(x=float(wx), y=float(wy), z=0.0)
         self.cmd_pub.publish(cmd)
 
         # ARRIVAL + PAUSE BETWEEN TILES
@@ -667,6 +665,7 @@ class RescueMission(Node):
             return
 
         req = UseKey.Request()
+
         req.door_loc = Point(x=float(wx), y=float(wy), z=0.0)
 
         future = self.use_key_client.call_async(req)
